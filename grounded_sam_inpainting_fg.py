@@ -4,7 +4,7 @@ import copy
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 # Grounding DINO
 import GroundingDINO.groundingdino.datasets.transforms as T
@@ -116,6 +116,48 @@ def copy_and_replace(orig_img, repl_img, mask_img):
             if mask_pixels[x, y]:
                 main_pixels[x, y] = repl_pixels[x, y]
 
+def image_crop_masked(orig_img, mask_img, offset=0.1):
+    # Find the bounding box of the mask image
+    y, x = np.where(np.array(mask_img) > 0)
+    left, top = np.min(x), np.min(y)
+    right, bottom = np.max(x), np.max(y)
+    
+    # Adjust the x,y coordinates dynamically
+    offset_x = round((right - left) * offset * 0.5)
+    offset_y = round((bottom - top) * offset * 0.5)
+    left, right = left - offset_x, right + offset_x
+    top, bottom = top - offset_y, bottom + offset_y
+
+    # Crop the rectangle area of the original image based on the bounding box
+    cropped_img = orig_img.crop((left, top, right, bottom))
+    cropped_mask = mask_img.crop((left, top, right, bottom))
+    return cropped_img, cropped_mask, left, top
+
+def image_resize_bounded(input_image, max_side=None):
+    if not isinstance(input_image, Image.Image):
+        raise TypeError("input_image must be a PIL Image instance")
+
+    # Determine the new size based on the maximum side
+    width, height = input_image.size
+    max_side = min(max_side, max(width, height))
+    if width > height:
+        new_width = max_side
+        new_height = round(max_side * height / width)
+    else:
+        new_height = max_side
+        new_width = round(max_side * width / height)
+
+    # Ensure that the new height and width are multiples of 8
+    new_height -= new_height % 8
+    new_width -= new_width % 8
+
+    # Resize the image
+    new_size = (new_width, new_height)
+    resized_image = input_image.resize(new_size)
+
+    # Return the resized image
+    return resized_image
+
 
 if __name__ == "__main__":
 
@@ -203,6 +245,7 @@ if __name__ == "__main__":
         masks = torch.where(masks > 0, True, False)
     mask = masks[0][0].cpu().numpy() # simply choose the first mask, which will be refine in the future release
     mask_pil = Image.fromarray(mask) # ^ True) # inverse the detection
+    mask_pil = mask_pil.filter(ImageFilter.MaxFilter(size=5)) # dilation for the objects
     image_pil = Image.fromarray(image)
     
     pipe = StableDiffusionInpaintPipeline.from_pretrained(
@@ -211,9 +254,17 @@ if __name__ == "__main__":
     pipe = pipe.to("cuda")
 
     # prompt = "A sofa, high quality, detailed"
-    image = pipe(prompt=inpaint_prompt, image=image_pil.resize((512, 512)), mask_image=mask_pil.resize((512, 512))).images[0]
-    image = image.resize(size)
-    copy_and_replace(image_pil, image, mask_pil)
+    image_crop, mask_crop, left, top = image_crop_masked(image_pil, mask_pil, offset=0.1)
+    image_inp = image_resize_bounded(image_crop, max_side=800)
+    mask_inp = image_resize_bounded(mask_crop, max_side=800)
+    width, height = image_inp.size
+    #image_inp = image_pil.resize((720, 512))
+    #mask_inp = mask_pil.resize((720, 512))
+    image = pipe(prompt=inpaint_prompt, image=image_inp, mask_image=mask_inp, height=height, width=width).images[0]
+    #image = pipe(prompt=inpaint_prompt, image=image_inp.resize((512, 512)), mask_image=mask_inp.resize((512, 512))).images[0]
+    image = image.resize(image_crop.size)
+    image.save(os.path.join(output_dir, "inpainting.jpg"))
+    image_pil.paste(image, (left, top), mask_crop)
     image_pil.save(os.path.join(output_dir, "grounded_sam_inpainting_output.jpg"))
     mask_pil.save(os.path.join(output_dir, "mask.jpg"))
 

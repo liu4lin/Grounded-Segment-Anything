@@ -7,7 +7,7 @@ import argparse
 import numpy as np
 import torch
 import torchvision
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
 
 # Grounding DINO
 import GroundingDINO.groundingdino.datasets.transforms as T
@@ -127,8 +127,9 @@ def draw_box(box, draw, label):
 
 config_file = 'GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py'
 ckpt_repo_id = "ShilongLiu/GroundingDINO"
-ckpt_filenmae = "groundingdino_swint_ogc.pth"
-sam_checkpoint='sam_vit_h_4b8939.pth' 
+ckpt_filenmae = "/checkpoints/GroundingDINO/groundingdino_swint_ogc.pth"
+sam_checkpoint = '/checkpoints/SAM/sam_vit_h_4b8939.pth' 
+sd_inpainting = "/checkpoints/stable-diffusion-2-inpainting"
 output_dir="outputs"
 device="cuda"
 
@@ -139,7 +140,49 @@ groundingdino_model = None
 sam_predictor = None
 inpaint_pipeline = None
 
-def run_grounded_sam(input_image, text_prompt, task_type, inpaint_prompt, box_threshold, text_threshold, iou_threshold, inpaint_mode):
+def image_crop_masked(orig_img, mask_img, offset=0.1):
+    # Find the bounding box of the mask image
+    y, x = np.where(np.array(mask_img) > 0)
+    left, top = np.min(x), np.min(y)
+    right, bottom = np.max(x), np.max(y)
+    
+    # Adjust the x,y coordinates dynamically
+    offset_x = round((right - left) * offset * 0.5)
+    offset_y = round((bottom - top) * offset * 0.5)
+    left, right = left - offset_x, right + offset_x
+    top, bottom = top - offset_y, bottom + offset_y
+
+    # Crop the rectangle area of the original image based on the bounding box
+    cropped_img = orig_img.crop((left, top, right, bottom))
+    cropped_mask = mask_img.crop((left, top, right, bottom))
+    return cropped_img, cropped_mask, left, top
+
+def image_resize_bounded(input_image, max_side=None):
+    if not isinstance(input_image, Image.Image):
+        raise TypeError("input_image must be a PIL Image instance")
+
+    # Determine the new size based on the maximum side
+    width, height = input_image.size
+    max_side = min(max_side, max(width, height))
+    if width > height:
+        new_width = max_side
+        new_height = round(max_side * height / width)
+    else:
+        new_height = max_side
+        new_width = round(max_side * width / height)
+
+    # Ensure that the new height and width are multiples of 8
+    new_height -= new_height % 8
+    new_width -= new_width % 8
+
+    # Resize the image
+    new_size = (new_width, new_height)
+    resized_image = input_image.resize(new_size)
+
+    # Return the resized image
+    return resized_image
+
+def run_grounded_sam(input_image, text_prompt, task_type, inpaint_prompt, negative_prompt, box_threshold, text_threshold, iou_threshold, inpaint_mode, inpaint_area, inpaint_seed):
 
     global blip_processor, blip_model, groundingdino_model, sam_predictor, inpaint_pipeline
 
@@ -243,17 +286,35 @@ def run_grounded_sam(input_image, text_prompt, task_type, inpaint_prompt, box_th
             masks = torch.where(masks > 0, True, False)
         mask = masks[0][0].cpu().numpy() # simply choose the first mask, which will be refine in the future release
         mask_pil = Image.fromarray(mask)
+        mask_pil = mask_pil.filter(ImageFilter.MaxFilter(size=7)) # dilation
+        if inpaint_area == 'bg':
+            #mask_pil = Image.fromarray(mask ^ True)
+            mask_pil = ImageOps.invert(mask_pil) #Image.fromarray(np.array(mask_pil) ^ True) # inverse the detection
         
         if inpaint_pipeline is None:
             inpaint_pipeline = StableDiffusionInpaintPipeline.from_pretrained(
-            "runwayml/stable-diffusion-inpainting", torch_dtype=torch.float16
+            sd_inpainting, torch_dtype=torch.float16
             )
             inpaint_pipeline = inpaint_pipeline.to("cuda")
-
-        image = inpaint_pipeline(prompt=inpaint_prompt, image=image_pil.resize((512, 512)), mask_image=mask_pil.resize((512, 512))).images[0]
-        image = image.resize(size)
-
-        return [image, mask_pil]
+            inpaint_pipeline.enable_model_cpu_offload()
+            
+        if inpaint_area == 'bg' or max(size) <= 800:
+            image_crop, mask_crop, left, top = image_pil, mask_pil, 0, 0
+        else:
+            image_crop, mask_crop, left, top = image_crop_masked(image_pil, mask_pil, offset=0.1)
+        image_inp = image_resize_bounded(image_crop, max_side=800)
+        mask_inp = image_resize_bounded(mask_crop, max_side=800)
+        width, height = image_inp.size
+        if inpaint_seed and inpaint_seed.isdigit():
+            generator = [torch.Generator(device="cuda").manual_seed(int(inpaint_seed))]
+        else:
+            generator = None
+        image = inpaint_pipeline(prompt=inpaint_prompt, generator=generator, image=image_inp, mask_image=mask_inp, height=height, width=width, negative_prompt=negative_prompt).images[0]
+        image = image.resize(image_crop.size)
+        image_pil.paste(image, (left, top), mask_crop)
+        #image = inpaint_pipeline(prompt=inpaint_prompt, image=image_pil.resize((512, 512)), mask_image=mask_pil.resize((512, 512))).images[0]
+        #image = image.resize(size)
+        return [image_pil, image, mask_pil]
     else:
         print("task_type:{} error!".format(task_type))
 
@@ -278,6 +339,8 @@ if __name__ == "__main__":
                 task_type = gr.Dropdown(["det", "seg", "inpainting", "automatic"], value="automatic", label="task_type")
                 text_prompt = gr.Textbox(label="Text Prompt")
                 inpaint_prompt = gr.Textbox(label="Inpaint Prompt")
+                negative_prompt = gr.Textbox(label="Negative Inpaint Prompt")
+                inpaint_seed = gr.Textbox(label="Inpaint Seed")
                 run_button = gr.Button(label="Run")
                 with gr.Accordion("Advanced options", open=False):
                     box_threshold = gr.Slider(
@@ -290,6 +353,7 @@ if __name__ == "__main__":
                         label="IOU Threshold", minimum=0.0, maximum=1.0, value=0.5, step=0.001
                     )
                     inpaint_mode = gr.Dropdown(["merge", "first"], value="merge", label="inpaint_mode")
+                    inpaint_area = gr.Dropdown(["bg", "fg"], value="fg", label="inpaint_area")
 
             with gr.Column():
                 gallery = gr.Gallery(
@@ -297,7 +361,7 @@ if __name__ == "__main__":
                 ).style(preview=True, grid=2, object_fit="scale-down")
 
         run_button.click(fn=run_grounded_sam, inputs=[
-                        input_image, text_prompt, task_type, inpaint_prompt, box_threshold, text_threshold, iou_threshold, inpaint_mode], outputs=gallery)
+                        input_image, text_prompt, task_type, inpaint_prompt, negative_prompt, box_threshold, text_threshold, iou_threshold, inpaint_mode, inpaint_area, inpaint_seed], outputs=gallery)
 
 
-    block.launch(server_name='0.0.0.0', server_port=args.port, debug=args.debug, share=args.share)
+    block.launch(server_name='0.0.0.0', server_port=args.port, debug=args.debug, share=args.share, file_directories=['/tmp/'])

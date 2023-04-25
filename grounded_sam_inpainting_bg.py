@@ -4,7 +4,7 @@ import copy
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 # Grounding DINO
 import GroundingDINO.groundingdino.datasets.transforms as T
@@ -115,6 +115,96 @@ def copy_and_replace(orig_img, repl_img, mask_img):
         for y in range(orig_img.height):
             if mask_pixels[x, y]:
                 main_pixels[x, y] = repl_pixels[x, y]
+                
+def image_crop_masked(orig_img, mask_img, offset=0.1):
+    # Find the bounding box of the mask image
+    y, x = np.where(np.array(mask_img) > 0)
+    left, top = np.min(x), np.min(y)
+    right, bottom = np.max(x), np.max(y)
+    
+    # Adjust the x,y coordinates dynamically
+    offset_x = round((right - left) * offset * 0.5)
+    offset_y = round((bottom - top) * offset * 0.5)
+    left, right = left - offset_x, right + offset_x
+    top, bottom = top - offset_y, bottom + offset_y
+
+    # Crop the rectangle area of the original image based on the bounding box
+    cropped_img = orig_img.crop((left, top, right, bottom))
+    cropped_mask = mask_img.crop((left, top, right, bottom))
+    return cropped_img, cropped_mask, left, top
+        
+def image_resize_bounded(input_image, max_side=None):
+    if not isinstance(input_image, Image.Image):
+        raise TypeError("input_image must be a PIL Image instance")
+
+    # Determine the new size based on the maximum side
+    width, height = input_image.size
+    max_side = min(max_side, max(width, height))
+    if width > height:
+        new_width = max_side
+        new_height = round(max_side * height / width)
+    else:
+        new_height = max_side
+        new_width = round(max_side * width / height)
+
+    # Ensure that the new height and width are multiples of 8
+    new_height -= new_height % 8
+    new_width -= new_width % 8
+
+    # Resize the image
+    new_size = (new_width, new_height)
+    resized_image = input_image.resize(new_size)
+
+    # Return the resized image
+    return resized_image
+
+
+
+def copy_paste_with_smooth_filter(background_image, foreground_image, mask_image, position):
+    # Create a new image to paste the foreground onto
+    new_image = Image.new('RGBA', background_image.size, (0, 0, 0, 0))
+
+    # Paste the foreground image onto the new image based on the mask
+    new_image.paste(foreground_image, position, mask_image)
+
+    # Iterate through each pixel of the new image and apply a smooth filter to a window of pixels
+    # that have a mixture mask value with the boundary mask
+    for x in range(new_image.width):
+        for y in range(new_image.height):
+            # Get the mask value at the current pixel
+            mask_value = mask_image.getpixel((x, y))
+
+            # If the mask value is in the mixture range, check the window for a mixture of True and False mask values
+            if mask_value > 0 and mask_value < 255:
+                # Define the window size for the smooth filter
+                window_size = 5
+
+                # Get the pixel values for the current window
+                window_box = (x-window_size, y-window_size, x+window_size, y+window_size)
+                window_mask_region = mask_image.crop(window_box)
+
+                # Check if the window mask region has a mixture of True and False mask values
+                if all(pixel == True or pixel == False for pixel in window_mask_region.getdata()):
+                    # Apply the smooth filter to the window region
+                    window_region = new_image.crop(window_box)
+                    smoothed_window_region = window_region.filter(ImageFilter.SMOOTH)
+                    new_image.paste(smoothed_window_region, window_box)
+
+    # Convert the background image to "RGBA" mode if it is not already
+    if background_image.mode != 'RGBA':
+        background_image = background_image.convert('RGBA')
+
+    # Convert the new image to "RGBA" mode if it is not already
+    if new_image.mode != 'RGBA':
+        new_image = new_image.convert('RGBA')
+
+    # Paste the new image onto the background image
+    result_image = Image.alpha_composite(background_image, new_image)
+    result_image = result_image.convert('RGB')
+    return result_image
+
+
+
 
 
 if __name__ == "__main__":
@@ -202,7 +292,9 @@ if __name__ == "__main__":
         masks = torch.sum(masks, dim=0).unsqueeze(0)
         masks = torch.where(masks > 0, True, False)
     mask = masks[0][0].cpu().numpy() # simply choose the first mask, which will be refine in the future release
-    mask_pil = Image.fromarray(mask) # ^ True) # inverse the detection
+    mask_pil = Image.fromarray(mask)
+    mask_pil = mask_pil.filter(ImageFilter.MaxFilter(size=3)) # dilation
+    mask_pil = Image.fromarray(np.array(mask_pil) ^ True) # inverse the detection
     image_pil = Image.fromarray(image)
     
     pipe = StableDiffusionInpaintPipeline.from_pretrained(
@@ -211,9 +303,19 @@ if __name__ == "__main__":
     pipe = pipe.to("cuda")
 
     # prompt = "A sofa, high quality, detailed"
-    image = pipe(prompt=inpaint_prompt, image=image_pil.resize((512, 512)), mask_image=mask_pil.resize((512, 512))).images[0]
-    image = image.resize(size)
-    copy_and_replace(image_pil, image, mask_pil)
+    #image_inp, mask_inp, left, top = image_crop_mask(image_pil, mask_pil, offset=0)
+    image_inp = image_resize_bounded(image_pil, max_side=800)
+    mask_inp = image_resize_bounded(mask_pil, max_side=800)
+    width, height = image_inp.size
+    #image_inp = image_pil.resize((720, 512))
+    #mask_inp = mask_pil.resize((720, 512))
+    image = pipe(prompt=inpaint_prompt, image=image_inp, mask_image=mask_inp, height=height, width=width).images[0]
+    image.save(os.path.join(output_dir, "inpainting.jpg"))
+    image = image.resize(image_pil.size)
+    
+    image_pil.paste(image, (0, 0), mask_pil)
+    #image_pil = copy_paste_with_smooth_filter(image_pil, image, mask_pil, (0, 0))
+    
     image_pil.save(os.path.join(output_dir, "grounded_sam_inpainting_output.jpg"))
     mask_pil.save(os.path.join(output_dir, "mask.jpg"))
 
