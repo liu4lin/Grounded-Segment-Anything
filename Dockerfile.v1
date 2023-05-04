@@ -1,3 +1,4 @@
 # sudo docker build -t=gsam:v1 -f Dockerfile.v1 .
 FROM gsam:v0
 RUN pip install gradio
+RUN pip install -U xformers

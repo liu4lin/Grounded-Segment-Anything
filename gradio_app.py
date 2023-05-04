@@ -7,7 +7,7 @@ import argparse
 import numpy as np
 import torch
 import torchvision
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps, ImageChops
 
 # Grounding DINO
 import GroundingDINO.groundingdino.datasets.transforms as T
@@ -129,7 +129,8 @@ config_file = 'GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py'
 ckpt_repo_id = "ShilongLiu/GroundingDINO"
 ckpt_filenmae = "/checkpoints/GroundingDINO/groundingdino_swint_ogc.pth"
 sam_checkpoint = '/checkpoints/SAM/sam_vit_h_4b8939.pth' 
-sd_inpainting = "/checkpoints/stable-diffusion-2-inpainting"
+sd1_inpainting = "/checkpoints/stable-diffusion-inpainting"
+sd2_inpainting = "/checkpoints/stable-diffusion-2-inpainting"
 output_dir="outputs"
 device="cuda"
 
@@ -139,6 +140,9 @@ blip_model = None
 groundingdino_model = None
 sam_predictor = None
 inpaint_pipeline = None
+inpaint1_pipeline = None
+inpaint2_pipeline = None
+
 
 def image_crop_masked(orig_img, mask_img, offset=0.1):
     # Find the bounding box of the mask image
@@ -182,9 +186,9 @@ def image_resize_bounded(input_image, max_side=None):
     # Return the resized image
     return resized_image
 
-def run_grounded_sam(input_image, text_prompt, task_type, inpaint_prompt, negative_prompt, box_threshold, text_threshold, iou_threshold, inpaint_mode, inpaint_area, inpaint_seed):
+def run_grounded_sam(input_image, text_prompt, task_type, sd_type, inpaint_prompt, negative_prompt, box_threshold, text_threshold, iou_threshold, filter_size, num_inference_steps, inpaint_mode, inpaint_area, inpaint_seed):
 
-    global blip_processor, blip_model, groundingdino_model, sam_predictor, inpaint_pipeline
+    global blip_processor, blip_model, groundingdino_model, sam_predictor, inpaint1_pipeline, inpaint2_pipeline, inpaint_pipeline
 
     # make dir
     os.makedirs(output_dir, exist_ok=True)
@@ -285,31 +289,52 @@ def run_grounded_sam(input_image, text_prompt, task_type, inpaint_prompt, negati
             masks = torch.sum(masks, dim=0).unsqueeze(0)
             masks = torch.where(masks > 0, True, False)
         mask = masks[0][0].cpu().numpy() # simply choose the first mask, which will be refine in the future release
-        mask_pil = Image.fromarray(mask)
-        mask_pil = mask_pil.filter(ImageFilter.MaxFilter(size=7)) # dilation
-        if inpaint_area == 'bg':
-            #mask_pil = Image.fromarray(mask ^ True)
-            mask_pil = ImageOps.invert(mask_pil) #Image.fromarray(np.array(mask_pil) ^ True) # inverse the detection
-        
-        if inpaint_pipeline is None:
-            inpaint_pipeline = StableDiffusionInpaintPipeline.from_pretrained(
-            sd_inpainting, torch_dtype=torch.float16
-            )
-            inpaint_pipeline = inpaint_pipeline.to("cuda")
-            inpaint_pipeline.enable_model_cpu_offload()
+        mask_base = Image.fromarray(mask) # black = 0/False/Keep, white = 1/True/Inpaint
+        if filter_size < 0:
+            mask_base = mask_base.filter(ImageFilter.MinFilter(size=-filter_size)) # erosion
+        if filter_size > 0:
+            mask_base = mask_base.filter(ImageFilter.MaxFilter(size=filter_size)) # dilation
             
-        if inpaint_area == 'bg' or max(size) <= 800:
+        if inpaint_area == 'fg':
+            mask_pil = mask_base
+        if inpaint_area == 'bg':
+            mask_pil = ImageOps.invert(mask_base) 
+        if inpaint_area == 'md':
+            im1 = mask_base.filter(ImageFilter.MinFilter(size=abs(filter_size)))
+            im2 = mask_base.filter(ImageFilter.MaxFilter(size=abs(filter_size)))
+            mask_pil = ImageChops.logical_xor(im1, im2)
+            
+        if inpaint1_pipeline is None:
+            inpaint1_pipeline = StableDiffusionInpaintPipeline.from_pretrained(
+            sd1_inpainting, torch_dtype=torch.float16
+            )
+            inpaint1_pipeline.enable_model_cpu_offload()
+
+        if inpaint2_pipeline is None:
+            inpaint2_pipeline = StableDiffusionInpaintPipeline.from_pretrained(
+            sd2_inpainting, torch_dtype=torch.float16
+            )
+            inpaint2_pipeline.enable_model_cpu_offload()
+            
+        if sd_type == 'sd1':
+            inpaint_pipeline = inpaint1_pipeline#.to("cuda")
+            print(f"Switch to sd inpainting: {sd1_inpainting}")
+        else: # sd2
+            inpaint_pipeline = inpaint2_pipeline
+            print(f"Switch to sd inpainting: {sd2_inpainting}")
+            
+        if inpaint_area == 'bg' or max(size) <= 1280:
             image_crop, mask_crop, left, top = image_pil, mask_pil, 0, 0
         else:
-            image_crop, mask_crop, left, top = image_crop_masked(image_pil, mask_pil, offset=0.1)
-        image_inp = image_resize_bounded(image_crop, max_side=800)
-        mask_inp = image_resize_bounded(mask_crop, max_side=800)
+            image_crop, mask_crop, left, top = image_crop_masked(image_pil, mask_pil, offset=0.2)
+        image_inp = image_resize_bounded(image_crop, max_side=1280)
+        mask_inp = image_resize_bounded(mask_crop, max_side=1280)
         width, height = image_inp.size
         if inpaint_seed and inpaint_seed.isdigit():
             generator = [torch.Generator(device="cuda").manual_seed(int(inpaint_seed))]
         else:
             generator = None
-        image = inpaint_pipeline(prompt=inpaint_prompt, generator=generator, image=image_inp, mask_image=mask_inp, height=height, width=width, negative_prompt=negative_prompt).images[0]
+        image = inpaint_pipeline(prompt=inpaint_prompt, generator=generator, image=image_inp, mask_image=mask_inp, height=height, width=width, num_inference_steps=num_inference_steps, negative_prompt=negative_prompt).images[0]
         image = image.resize(image_crop.size)
         image_pil.paste(image, (left, top), mask_crop)
         #image = inpaint_pipeline(prompt=inpaint_prompt, image=image_pil.resize((512, 512)), mask_image=mask_pil.resize((512, 512))).images[0]
@@ -322,7 +347,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser("Grounded SAM demo", add_help=True)
     parser.add_argument("--debug", action="store_true", help="using debug mode")
     parser.add_argument("--share", action="store_true", help="share the app")
-    parser.add_argument('--port', type=int, default=7589, help='port to run the server')
+    parser.add_argument('--port', type=int, default=30000, help='port to run the server')
     parser.add_argument('--no-gradio-queue', action="store_true", help='path to the SAM checkpoint')
     args = parser.parse_args()
 
@@ -336,7 +361,9 @@ if __name__ == "__main__":
         with gr.Row():
             with gr.Column():
                 input_image = gr.Image(source='upload', type="pil", value="assets/demo1.jpg")
-                task_type = gr.Dropdown(["det", "seg", "inpainting", "automatic"], value="automatic", label="task_type")
+                #task_type = gr.Dropdown(["det", "seg", "inpainting", "automatic"], value="automatic", label="task_type")
+                task_type = gr.Dropdown(["det", "seg", "inpainting"], value="inpainting", label="task_type")
+                sd_type = gr.Dropdown(["sd1", "sd2"], value="sd2", label="sd_type")
                 text_prompt = gr.Textbox(label="Text Prompt")
                 inpaint_prompt = gr.Textbox(label="Inpaint Prompt")
                 negative_prompt = gr.Textbox(label="Negative Inpaint Prompt")
@@ -352,8 +379,14 @@ if __name__ == "__main__":
                     iou_threshold = gr.Slider(
                         label="IOU Threshold", minimum=0.0, maximum=1.0, value=0.5, step=0.001
                     )
+                    filter_size = gr.Slider(
+                        label="Erosion/Dilation Filter Size", minimum=-50, maximum=50, value=0, step=1
+                    )
+                    num_inference_steps = gr.Slider(
+                        label="Number Inference Steps", minimum=1, maximum=100, value=50, step=1
+                    )
                     inpaint_mode = gr.Dropdown(["merge", "first"], value="merge", label="inpaint_mode")
-                    inpaint_area = gr.Dropdown(["bg", "fg"], value="fg", label="inpaint_area")
+                    inpaint_area = gr.Dropdown(["bg", "fg", "md"], value="fg", label="inpaint_area")
 
             with gr.Column():
                 gallery = gr.Gallery(
@@ -361,7 +394,7 @@ if __name__ == "__main__":
                 ).style(preview=True, grid=2, object_fit="scale-down")
 
         run_button.click(fn=run_grounded_sam, inputs=[
-                        input_image, text_prompt, task_type, inpaint_prompt, negative_prompt, box_threshold, text_threshold, iou_threshold, inpaint_mode, inpaint_area, inpaint_seed], outputs=gallery)
+                        input_image, text_prompt, task_type, sd_type, inpaint_prompt, negative_prompt, box_threshold, text_threshold, iou_threshold, filter_size, num_inference_steps, inpaint_mode, inpaint_area, inpaint_seed], outputs=gallery)
 
 
     block.launch(server_name='0.0.0.0', server_port=args.port, debug=args.debug, share=args.share, file_directories=['/tmp/'])
